@@ -101,6 +101,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxkbcommon-dev pkg-config xvfb libxkbcommon-x11-0
+          # 画面を写す（tools/screens.sh。ImageMagick の import）・Ubuntu の日本語の UI 字体（ADR-0024）
+          sudo apt-get install -y imagemagick fonts-noto-cjk
 
       # 同梱字体はリポジトリに無い（ADR-0008。参照元と同じ）。版を固定してあるので鍵は取得スクリプト
       - name: 同梱字体のキャッシュ
@@ -162,6 +164,23 @@ jobs:
               python tools/standalone-check.py --exe "$exe"
             fi
           done
+
+      # 7 本の画面を明るい・暗いの配色で写して成果物に残す（ADR-0024。手元に無い OS の見た目を確かめる）。落ちても先へ進む
+      - name: 画面を写す
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a -s "-screen 0 1280x800x24" bash tools/screens.sh target/release screens
+          else
+            bash tools/screens.sh target/release screens
+          fi
+
+      - uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: screens-${{ runner.os }}
+          path: screens/
 
       # 実行の結果から実行ファイルを落とせるように（2026-11-11。利用者の指示。手元で組まないため）。配る形（インストーラ・
       # .app）は release.yml。ここは 1 本ずつの実行ファイル（1 本だけ置いても動く。ADR-0010）
