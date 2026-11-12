@@ -1,0 +1,311 @@
+# 出典: claudecode-tauri-markdown-viewer .github/workflows/ci.yml の配る物の組み立てと煙試験（d4d0e35。ADR-0004）。7 本に合わせた
+#
+# 配布物を組む（基本設計書 §3.5・ADR-0010・技術選定書 §10）。
+#
+# 手で動かし、3 OS でリリースビルドを組み、インストーラと単体の実行ファイルを作って、入れて・起動して・消せるかを確かめ、
+# 成果物（artifact）に置く。モバイル（署名した APK・ad-hoc 署名の .ipa）は ci.yml を呼んで組む（v0.10.0）。
+# **引数 publish を true にしたときだけ GitHub の Release を作る**。版の印は Cargo.toml の版（v<版>）。同じ版の Release が
+# 既にあれば作らない。印は公開リポジトリのこのワークフローのコミットに打つ（**ソースは公開リポジトリに置かない**。2026-11-12。
+# ソースは非公開リポジトリから読み取りだけの deploy key で取り出す）。動かし方：
+#   gh workflow run release.yml -R yuazuma/sdie -f ref=<コミット> -f publish=true
+#   Windows: Inno Setup のインストーラ（7 本。種類ごとに関連付けを選べる）と zip
+#   macOS:   7 つの .app を入れた .dmg と、.app ごとの zip
+#   Linux:   .deb（7 本と 7 つの .desktop）・7 つの AppImage の書庫・単体の tar.gz
+#
+# **CPU の種類は `--target` で決める**（参照元と同じ。組む機械の種類に任せない。モバイルでは任せて、実機に入らない APK が
+# できた）。配る種類：Windows x86_64・macOS aarch64（Apple シリコン）・Linux x86_64
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "組む非公開リポジトリのコミット（枝の名前・コミットの番号）"
+        type: string
+        required: true
+      publish:
+        description: "Release を作る（版は Cargo.toml の版）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BINS: -p textedit -p jsonedit -p yamledit -p csvedit -p xmledit -p hexedit -p mdedit
+  NAMES: textedit jsonedit yamledit csvedit xmledit hexedit mdedit
+
+jobs:
+  package:
+    name: 配布物（${{ matrix.label }}）
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x86_64
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            label: macos-aarch64
+            target: aarch64-apple-darwin
+          # **版を固定する**（参照元と同じ）。latest のままだと、上がったときに新しい glibc で組まれ、古い配布物で動かなくなる
+          - os: ubuntu-24.04
+            label: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      # ソースは非公開リポジトリから取り出す（公開リポジトリにソースを置かない。2026-11-12。読み取りだけの deploy key）
+      - uses: actions/checkout@v7
+        with:
+          repository: yuazuma/claudecode-rust-sdi-editor
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Rust ツールチェーンを用意する
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+
+      - name: Linux のビルド依存を入れる
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxkbcommon-dev pkg-config
+
+      - name: 同梱字体を取得する
+        run: python tools/fetch-fonts.py
+
+      - name: macOS の起動用を型検査する
+        # Finder から開いたファイルを受け取る小さなアプリ。**Swift は macOS でしか試せない**ので、ここで書き損じを拾う
+        if: runner.os == 'macOS'
+        run: swiftc -typecheck packaging/macos/launcher/main.swift
+
+      - name: 組み立て（リリース）
+        run: cargo build --release --target ${{ matrix.target }} ${{ env.BINS }}
+
+      - name: 実行ファイルの CPU の種類を確かめる
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          for name in $NAMES; do
+            file "target/${{ matrix.target }}/release/$name"
+          done
+
+      # --- Windows ---
+      - name: Inno Setup を入れる
+        if: runner.os == 'Windows'
+        run: choco install innosetup -y --no-progress
+
+      - name: Windows のインストーラと zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: packaging/windows/build-installer.ps1 -SourceDir target/${{ matrix.target }}/release -OutputDir dist
+
+      # 入れて・起動して・消せるかを確かめる。答えは .NET の Process で受け取る（GUI のアプリなので `& $exe --version` では空になる）
+      - name: 入れて消す煙試験（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist/*-setup.exe | Select-Object -First 1
+          Write-Host "試す: $($setup.Name)"
+          Start-Process -FilePath $setup.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+          $dir = "$env:LOCALAPPDATA\Programs\SDI Editor"
+          function Get-Answer([string]$Path, [string]$Argument) {
+            $info = New-Object System.Diagnostics.ProcessStartInfo
+            $info.FileName = $Path
+            $info.Arguments = $Argument
+            $info.UseShellExecute = $false
+            $info.RedirectStandardOutput = $true
+            $info.CreateNoWindow = $true
+            $process = [System.Diagnostics.Process]::Start($info)
+            $out = $process.StandardOutput.ReadToEnd()
+            $process.WaitForExit()
+            if ($process.ExitCode -ne 0) { throw "$Path $Argument が終了コード $($process.ExitCode) で終わった" }
+            return $out.Trim()
+          }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          foreach ($name in $env:NAMES -split ' ') {
+            $exe = Join-Path $dir "$name.exe"
+            if (-not (Test-Path $exe)) { throw "入ったはずの $exe が無い" }
+            $answer = Get-Answer $exe '--version'
+            Write-Host "起動できた: $answer"
+            if ($answer -ne "$name $version") { throw "版数が違う: [$answer]（期待: $name $version）" }
+          }
+          $uninstall = Get-ChildItem "$dir\unins*.exe" | Select-Object -First 1
+          Start-Process -FilePath $uninstall.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+          # 消えるまで待つ（アンインストーラは自分を写してすぐ戻るので `-Wait` が効かない）
+          $first = Join-Path $dir 'textedit.exe'
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Test-Path $first) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+          if (Test-Path $first) { throw "消したはずの $first が 60 秒たっても残っている" }
+          Write-Host "入れて・起動して・消せた"
+
+      # --- macOS ---
+      - name: macOS の .dmg
+        if: runner.os == 'macOS'
+        run: bash packaging/macos/build-dmg.sh target/${{ matrix.target }}/release dist
+
+      - name: dmg の煙試験
+        if: runner.os == 'macOS'
+        run: |
+          set -eu
+          package=$(ls dist/*.dmg)
+          echo "試す: $package"
+          mount=$(mktemp -d)
+          hdiutil attach "$package" -mountpoint "$mount" -nobrowse -quiet
+          for name in $NAMES; do
+            app="$mount/$name.app"
+            editor="$app/Contents/Helpers/$name.app"
+            test -x "$app/Contents/MacOS/$name" || { echo "$name の起動用が無い"; exit 1; }
+            test -x "$editor/Contents/MacOS/$name" || { echo "$name の本体が無い"; exit 1; }
+            test -f "$app/Contents/Resources/$name.icns" || { echo "$name のアイコンが無い"; exit 1; }
+            plutil -lint "$app/Contents/Info.plist"
+            plutil -lint "$editor/Contents/Info.plist"
+            outer=$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")
+            inner=$(plutil -extract CFBundleIdentifier raw "$editor/Contents/Info.plist")
+            [ "$outer" != "$inner" ] || { echo "バンドル ID が同じ: $outer"; exit 1; }
+            "$editor/Contents/MacOS/$name" --version
+            # 起動用が本体へ引数を渡せること
+            "$app/Contents/MacOS/$name" --version | grep -q "^$name " || { echo "$name の起動用が本体へ引数を渡せない"; exit 1; }
+          done
+          hdiutil detach "$mount" -quiet
+          echo "開いて・起動できた"
+
+      # --- Linux ---
+      - name: Linux の .deb と AppImage
+        if: runner.os == 'Linux'
+        run: |
+          bash packaging/linux/build-deb.sh target/${{ matrix.target }}/release dist
+          bash packaging/linux/build-appimage.sh target/${{ matrix.target }}/release dist
+
+      - name: deb の煙試験
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          package=$(ls dist/*.deb)
+          echo "試す: $package"
+          # `dpkg -i` ではなく `apt-get install ./…`（受け取った側と同じ経路。依存を取りに行く）
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y "./$package"
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)
+          sudo apt-get install -y desktop-file-utils >/dev/null
+          for name in $NAMES; do
+            answer=$("/usr/bin/$name" --version)
+            echo "起動できた: $answer"
+            [ "$answer" = "$name $version" ] || { echo "版数が違う: $answer"; exit 1; }
+            desktop-file-validate "/usr/share/applications/$name.desktop"
+          done
+          sudo dpkg -r sdi-editor
+          test ! -e /usr/bin/textedit || { echo "消したはずの実行ファイルが残っている"; exit 1; }
+          echo "入れて・起動して・消せた"
+
+      # **まっさらな環境（Debian 13）に依存だけを入れ、窓を出せるかを見る**（参照元と同じ。`--init` を外さない：
+      # 外すと Xvfb の準備完了の合図が届かずに待ち続ける）
+      - name: まっさらな環境で deb を起動する
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: |
+          set -eu
+          package=$(ls dist/*.deb)
+          docker run --rm --init -v "$PWD:/w" -w /w -e PACKAGE="$package" -e PYTHONDONTWRITEBYTECODE=1 \
+            debian:13-slim bash -euc '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends "./$PACKAGE" >/dev/null
+              bash packaging/linux/check-runtime-libs.sh
+              apt-get install -y -qq --no-install-recommends xvfb xauth python3 >/dev/null
+              xvfb-run -a -s "-screen 0 1280x800x24" python3 tools/standalone-check.py --exe /usr/bin/textedit'
+
+      - name: AppImage の煙試験
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          work=$(mktemp -d)
+          tar -xzf dist/*-appimage.tar.gz -C "$work"
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)
+          # ランナーに FUSE が無いので展開して動かす
+          for name in $NAMES; do
+            APPIMAGE_EXTRACT_AND_RUN=1 "$work/$name-$version-x86_64.AppImage" --version
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdi-editor-${{ matrix.label }}
+          path: dist/
+          if-no-files-found: error
+
+  # モバイル（ci.yml の mobile ジョブ。成果物 sdi-editor-android・sdi-editor-ios）。署名の鍵は Secrets を渡す
+  mobile:
+    name: モバイル
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ inputs.ref }}
+      target: mobile
+    secrets: inherit
+
+  publish:
+    name: Release を作る
+    needs: [package, mobile]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # ソースは非公開リポジトリから取り出す（公開リポジトリにソースを置かない。2026-11-12。読み取りだけの deploy key）
+      - uses: actions/checkout@v7
+        with:
+          repository: yuazuma/claudecode-rust-sdi-editor
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: 版を決める（Cargo.toml の版。同じ版の Release があれば作らない）
+        id: version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)
+          tag="v$version"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "$tag の Release は既にある。版を上げてから動かす"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "source=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: sdi-editor-*
+          path: downloaded
+
+      - name: 配布物をそろえて Release を作る
+        run: |
+          set -eu
+          version=${{ steps.version.outputs.version }}
+          tag=${{ steps.version.outputs.tag }}
+          mkdir -p dist
+          # **同じ名前が 2 つあれば止める**（黙って上書きすると、配る物が欠ける）
+          find downloaded -type f | while read -r file; do
+            target="dist/$(basename "$file")"
+            [ ! -e "$target" ] || { echo "同じ名前の配布物が 2 つある：$(basename "$file")"; exit 1; }
+            cp "$file" "$target"
+          done
+          # モバイルの名前に版を入れる（PC は包む段で版が入っている）
+          mv dist/sdi-editor.apk "dist/sdi-editor-${version}-android.apk"
+          mv dist/sdi-editor-ios-simulator.zip "dist/sdi-editor-${version}-ios-simulator.zip"
+          mv dist/sdi-editor-ios-device-unsigned.ipa "dist/sdi-editor-${version}-ios-unsigned.ipa"
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          ls -l dist
+          {
+            echo "SDI Editor ${tag}（ソースのコミット ${{ steps.version.outputs.source }}）"
+            echo
+            echo "- PC（Windows・macOS・Linux）：種類ごとの 7 本（textedit・jsonedit・yamledit・csvedit・xmledit・hexedit・mdedit）。インストーラと、1 本だけ置いても動く実行ファイル"
+            echo "- Android：1 つのアプリに全種類（\`sdi-editor-${version}-android.apk\`。arm64-v8a・x86_64）"
+            echo "- iOS：\`sdi-editor-${version}-ios-unsigned.ipa\` は ad-hoc 署名だけ。入れる人が無料の Apple ID で署名し直して入れる（Sideloadly・AltStore など）。\`-ios-simulator.zip\` はシミュレーター向け"
+            echo "- 照合値：\`SHA256SUMS.txt\`"
+          } > notes.md
+          # 版の印は公開リポジトリのこのワークフローのコミットに打つ（ソースの入ったコミットではない）。取り出したのは
+          # 非公開リポジトリなので、置き場は -R で指す
+          gh release create "$tag" dist/* -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "SDI Editor ${tag}" --notes-file notes.md

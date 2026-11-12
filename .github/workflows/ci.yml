@@ -1,0 +1,411 @@
+# CI（詳細設計書 §9）。PC（整形・静的検査・試験・組み立て・単体で動くことの確認）とモバイル（APK・.app の組み立て）を
+# 1 つのワークフローにまとめた（2026-11-11。もとは ci.yml と mobile.yml。分ける要が無く、動かし方を 1 つにするため）。
+#
+# **手で動かす**（2026-11-12 から。公開リポジトリ yuazuma/sdie に置き、ソースは非公開リポジトリから取り出して組む。
+# 公開リポジトリにはこのワークフローだけを置き、ソースを置かない）。引数で決める:
+#
+#   |引数 target|動くもの                    |
+#   |-----------|----------------------------|
+#   |linux      |PC（Linux だけ）             |
+#   |pc         |PC（Windows・macOS・Linux）  |
+#   |mobile     |モバイル（Android・iOS）     |
+#   |all        |PC（3 OS）とモバイル         |
+#
+#   ref は組む非公開リポジトリのコミット（枝の名前・コミットの番号）。動かし方：
+#     gh workflow run ci.yml -R yuazuma/sdie -f ref=<コミット> -f target=all
+#   **組み立てのログは誰でも見られる**（エラーはソースの行を出す）
+name: CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "組む非公開リポジトリのコミット（枝の名前・コミットの番号）"
+        type: string
+        required: true
+      target:
+        description: "動かすもの（linux：PC の Linux、pc：PC の 3 OS、mobile：Android・iOS、all：PC の 3 OS とモバイル）"
+        type: choice
+        options: [linux, pc, mobile, all]
+        default: linux
+  # release.yml から呼ぶ（モバイルの APK・.ipa を配布物に入れる。v0.10.0）。引数は手で動かすときと同じ
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+      target:
+        type: string
+        required: true
+
+concurrency:
+  # 組むコミットごと（違うコミットを同時に組める。同じコミットの新しい実行は前を取り消す）
+  group: ${{ github.workflow }}-${{ inputs.ref }}-${{ inputs.target }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    # 名前に matrix の式を書くと、飛ばしたとき式のまま出る（「PC（${{ matrix.os }}）」と見えた）。式を書かなければ、
+    # 動いたときは GitHub が OS を後ろに足す（PC (windows-latest)）
+    name: PC
+    if: inputs.target != 'mobile'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON((inputs.target == 'pc' || inputs.target == 'all') && '["windows-latest", "macos-latest", "ubuntu-latest"]' || '["ubuntu-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      # ソースは非公開リポジトリから取り出す（公開リポジトリにソースを置かない。2026-11-12。読み取りだけの deploy key）
+      - uses: actions/checkout@v7
+        with:
+          repository: yuazuma/claudecode-rust-sdi-editor
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Rust ツールチェーンを用意する
+        # 版数は rust-toolchain.toml に従う
+        run: rustup show
+
+      - name: Linux のビルド依存を入れる
+        if: runner.os == 'Linux'
+        # iced（wgpu / winit）が X11 と Wayland のヘッダを要求する（参照元と同じ）。
+        # xvfb と libxkbcommon-x11-0 は単体の起動確認で窓を出すため
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxkbcommon-dev pkg-config xvfb libxkbcommon-x11-0
+
+      # 同梱字体はリポジトリに無い（ADR-0008。参照元と同じ）。版を固定してあるので鍵は取得スクリプト
+      - name: 同梱字体のキャッシュ
+        id: fonts
+        uses: actions/cache@v6
+        with:
+          path: assets/fonts
+          key: fonts-${{ hashFiles('tools/fetch-fonts.py') }}
+
+      - name: 同梱字体を取得する
+        if: steps.fonts.outputs.cache-hit != 'true'
+        run: python tools/fetch-fonts.py
+
+      - name: 同梱字体を確かめる
+        run: python tools/fetch-fonts.py --check
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 整形
+        run: cargo fmt --all --check
+
+      - name: 静的検査
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 殻なしで組めること（ADR-0011。ロジックを UI に依存させない）
+        run: |
+          cargo check -p kind-text --no-default-features
+          cargo check -p kind-json --no-default-features
+          cargo check -p kind-yaml --no-default-features
+          cargo check -p kind-csv --no-default-features
+          cargo check -p kind-xml --no-default-features
+          cargo check -p kind-hex --no-default-features
+          cargo check -p kind-md --no-default-features
+          # モバイルの殻（v0.10）に登録する口
+          cargo check -p kind-text --no-default-features --features mobile
+          cargo check -p kind-hex --no-default-features --features mobile
+
+      - name: 試験
+        run: cargo test --workspace
+
+      - name: macOS の起動用を型検査する
+        # Finder から開いたファイルを受け取る小さなアプリ（packaging/macos）。**Swift は macOS でしか試せない**ので、
+        # 配るとき（release.yml）より前にここで書き損じを拾う（参照元と同じ）
+        if: runner.os == 'macOS'
+        run: swiftc -typecheck packaging/macos/launcher/main.swift
+
+      - name: 組み立て（リリース）
+        run: cargo build --release -p textedit -p jsonedit -p yamledit -p csvedit -p xmledit -p hexedit -p mdedit
+
+      - name: 単体で動くことの確認
+        shell: bash
+        run: |
+          for name in textedit jsonedit yamledit csvedit xmledit hexedit mdedit; do
+            exe=target/release/$name
+            if [ "$RUNNER_OS" = "Windows" ]; then exe="$exe.exe"; fi
+            if [ "$RUNNER_OS" = "Linux" ]; then
+              xvfb-run -a -s "-screen 0 1280x800x24" python3 tools/standalone-check.py --exe "$exe"
+            else
+              python tools/standalone-check.py --exe "$exe"
+            fi
+          done
+
+      # 実行の結果から実行ファイルを落とせるように（2026-11-11。利用者の指示。手元で組まないため）。配る形（インストーラ・
+      # .app）は release.yml。ここは 1 本ずつの実行ファイル（1 本だけ置いても動く。ADR-0010）
+      - name: 実行ファイルをまとめる
+        shell: bash
+        run: |
+          mkdir -p out
+          for name in textedit jsonedit yamledit csvedit xmledit hexedit mdedit; do
+            exe=target/release/$name
+            if [ "$RUNNER_OS" = "Windows" ]; then exe="$exe.exe"; fi
+            cp "$exe" out/
+          done
+          ls -l out
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdi-editor-${{ runner.os }}
+          path: out/
+          if-no-files-found: error
+
+  # ---- モバイル（もとは mobile.yml）----
+  # 出典: claudecode-tauri-markdown-viewer migration-v2/.github/workflows/ci.yml の mobile ジョブと
+  #       .github/workflows/v3-mobile-poc.yml（d4d0e35。ADR-0004）。この repo の土台・種類別のロジックと試作に替えた
+  #
+  # モバイルのアプリ（mobile/。v0.10。基本設計書 §8.5・ADR-0023）を組む。PoC-6〜8（research/poc-mobile-2026-11-11）の組み方を引き継いだ。
+  #
+  # 手元には Android・iOS の道具を入れない（利用者の判断。2026-11-11）ので、ここで組む。組めた APK・.app は成果物に残し、
+  # 端末での確かめは利用者が手で行う。
+  #
+  # **組み方は参照元の本番（mobile ジョブ）に合わせる**（参照元で実機に入った実績がある）:
+  #   - `dx` には `--target` を必ず渡す（渡さないとランナーの x86_64 で組み、ARM の実機で INSTALL_FAILED_NO_MATCHING_ABIS）
+  #   - Android は 64 ビットだけ（arm64-v8a・x86_64）。32 ビットは manganis 0.7.10 が組まない
+  #   - dx は ABI ごとに組んでもほかの ABI の部品を消さないので、2 つ目の APK に両方の ABI が入る（ユニバーサル APK）
+  #   - release の組み直しと鍵での署名はまだしない（dx が作る debug の署名の APK を、そのまま入れる）
+  # 結果は各ジョブの要約（Summary）に出す。土台と種類別のロジックの段は、落ちても先へ進める
+  mobile:
+    # 名前は式を書かない（PC と同じ理由）。matrix は platform だけにして、動いたときの名前を「モバイル (android)」にする
+    name: モバイル
+    if: inputs.target == 'mobile' || inputs.target == 'all'
+    runs-on: ${{ matrix.platform == 'ios' && 'macos-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 150
+    env:
+      # 組む対象（Android は 64 ビットの 2 つ、iOS はシミュレーターと実機）
+      TARGETS: ${{ matrix.platform == 'ios' && 'aarch64-apple-ios-sim aarch64-apple-ios' || 'aarch64-linux-android x86_64-linux-android' }}
+      CARGO_TERM_COLOR: never
+      DIOXUS_CLI_VERSION: "0.7.10"
+      # 種類別のロジック（殻なし。ADR-0011）。モバイルでもそのまま使えるか
+      KINDS: -p kind-text -p kind-json -p kind-yaml -p kind-csv -p kind-xml -p kind-hex -p kind-md
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [android, ios]
+    defaults:
+      run:
+        # bash と書くと pipefail が付く（`| tail` で cargo の失敗を隠さない）
+        shell: bash
+    steps:
+      # ソースは非公開リポジトリから取り出す（公開リポジトリにソースを置かない。2026-11-12。読み取りだけの deploy key）
+      - uses: actions/checkout@v7
+        with:
+          repository: yuazuma/claudecode-rust-sdi-editor
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Rust と対象を入れる
+        run: |
+          rustup show
+          rustup target add $TARGETS
+
+      - name: NDK の場所を決める（Android）
+        if: matrix.platform == 'android'
+        # ランナーに入っている NDK を使う。C の部品（rusqlite の SQLite など）を NDK の clang で組む（26 は Dioxus.toml の min_sdk）
+        run: |
+          ndk="$ANDROID_NDK_LATEST_HOME"
+          bin="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "NDK_HOME=$ndk"
+            echo "ANDROID_NDK_HOME=$ndk"
+            echo "JAVA_HOME=$JAVA_HOME_17_X64"
+            for t in $TARGETS; do
+              lower=$(echo "$t" | tr '-' '_')
+              upper=$(echo "$lower" | tr '[:lower:]' '[:upper:]')
+              echo "CC_${lower}=$bin/${t}26-clang"
+              echo "AR_${lower}=$bin/llvm-ar"
+              echo "CARGO_TARGET_${upper}_LINKER=$bin/${t}26-clang"
+            done
+          } >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            mobile -> target
+          key: mobile-${{ matrix.platform }}
+
+      - name: "1. 土台（sdi-core）を組む"
+        id: core
+        continue-on-error: true
+        run: |
+          for t in $TARGETS; do
+            echo "::group::$t"
+            cargo build -p sdi-core --release --target "$t" 2>&1 | tail -30
+            echo "::endgroup::"
+          done
+
+      - name: "2. 種類別のロジック（殻なし）を組む"
+        id: kinds
+        continue-on-error: true
+        run: |
+          for t in $TARGETS; do
+            echo "::group::$t"
+            cargo build $KINDS --no-default-features --release --target "$t" 2>&1 | tail -40
+            echo "::endgroup::"
+          done
+
+      # **トークンを渡し、向け先を決め、ほかの取得先へ逃げない**（参照元で踏んだ：トークンが無いと GitHub の API が 403 を返し、
+      # binstall が別の取得先から x86_64 の macOS 版を拾い、Apple Silicon のランナーで起動できずに落ちた）
+      - name: "3. Dioxus の CLI を入れる"
+        id: dx
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          case "$RUNNER_OS" in
+            macOS) host=aarch64-apple-darwin ;;
+            Linux) host=x86_64-unknown-linux-gnu ;;
+            *) echo "想定していない OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+          cargo binstall -y --force --targets "$host" --disable-strategies quick-install,compile \
+            "dioxus-cli@$DIOXUS_CLI_VERSION"
+          file "$(command -v dx)"
+          dx --version
+
+      - name: "4. アプリを APK に組む（Android：arm64-v8a・x86_64）"
+        id: apk
+        if: matrix.platform == 'android'
+        working-directory: mobile
+        # dx は 1 回に 1 つの ABI しか組まない。ABI ごとに組み、前の APK（キャッシュから戻ったもの・前の ABI のもの）を
+        # 拾わないよう、組む前に消す。最後の APK に両方の ABI が入る（dx はほかの ABI の jniLibs を消さない）
+        run: |
+          set -eu
+          mkdir -p out
+          for t in $TARGETS; do
+            echo "::group::$t"
+            find target -name '*.apk' -delete 2>/dev/null || true
+            dx bundle --platform android --target "$t" --release --no-default-features --features mobile
+            apk=$(find target -name '*.apk' | head -1)
+            test -n "$apk" || { echo "$t の APK が見つからない"; exit 1; }
+            echo "APK: $apk"
+            echo "::endgroup::"
+          done
+          cp "$apk" out/sdi-editor.apk
+          unzip -l out/sdi-editor.apk | grep ' lib/'
+          # **「このアプリで開く」の受け口が入っていること**（mobile/AndroidManifest.xml が使われたか）
+          aapt=$(ls "$ANDROID_HOME"/build-tools/*/aapt | sort -V | tail -1)
+          "$aapt" dump xmltree out/sdi-editor.apk AndroidManifest.xml > out/manifest.txt
+          grep -q 'android.intent.action.VIEW' out/manifest.txt || { echo "受け口（VIEW）が無い"; exit 1; }
+          grep -q '"\*/\*"' out/manifest.txt || { echo "受け口の形式（*/*）が無い"; exit 1; }
+          rm out/manifest.txt
+          # **2 つの ABI の部品がそろっていること**（足りないと、その ABI の端末が入れるのを断る）
+          for abi in arm64-v8a x86_64; do
+            unzip -l out/sdi-editor.apk | grep -q " lib/${abi}/[^/]*\.so$" || { echo "APK に lib/${abi} が無い"; exit 1; }
+          done
+          ls -l out
+
+      # **署名は参照元と同じ方式**（参照元 migration-v2/.github/workflows/ci.yml の「APK に署名する」。2026-11-11 利用者の指示）:
+      #   - dx は Dioxus.toml に署名の設定が無いと Gradle の debug で組み、デバッグ用の鍵（実行のたびに作り直される）で
+      #     署名した debuggable の APK になる。前の版の上に入れられず、毎回アンインストールが要った
+      #   - dx が作った Gradle の作業場で assembleRelease を走らせ、署名なしの release の APK を作る（鍵を dx の設定に書かない）
+      #   - **zipalign してから** apksigner で、GitHub Secrets の鍵で署名する（整列の前に署名すると壊れる）
+      #   - **秘密が無ければ署名しない**（フォーク・鍵を置く前）。そのときは前の段の debug の APK をそのまま残す
+      - name: "5. APK に署名する（Android。鍵があるとき）"
+        id: sign
+        if: matrix.platform == 'android'
+        working-directory: mobile
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -eu
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "署名の鍵（秘密）が無いので署名しない。debug の APK を残す（入れ直すときはアンインストールが要る）"
+            exit 0
+          fi
+          tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          gradlew=$(find target/dx -name gradlew -path '*android*' | head -1)
+          test -n "$gradlew" || { echo "dx の Gradle の作業場が見つからない"; exit 1; }
+          root=$(dirname "$gradlew")
+          (cd "$root" && chmod +x gradlew && ./gradlew --no-daemon assembleRelease)
+          release=$(find "$root" -path '*outputs/apk/release*' -name '*.apk' | head -1)
+          test -n "$release" || { echo "release の APK が見つからない"; find "$root" -name '*.apk'; exit 1; }
+          cp "$release" out/unsigned.apk
+          # **2 つの ABI の部品がそろっていること**・**デバッグ用の組み立てでないこと**（参照元と同じ）
+          for abi in arm64-v8a x86_64; do
+            unzip -l out/unsigned.apk | grep -q " lib/${abi}/[^/]*\.so$" || { echo "release の APK に lib/${abi} が無い"; exit 1; }
+          done
+          if "$tools/aapt2" dump badging out/unsigned.apk | grep -q "application-debuggable"; then
+            echo "APK がデバッグ用の組み立て（debuggable）になっている"; exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          "$tools/zipalign" -f -p 4 out/unsigned.apk out/aligned.apk
+          "$tools/apksigner" sign --ks "$RUNNER_TEMP/release.jks"             --ks-pass env:KEYSTORE_PASSWORD --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD             --out out/sdi-editor.apk out/aligned.apk
+          # apksigner は v4 の署名を別のファイル（.idsig）に書く。手で入れるときには要らず、Release に紛れたので消す（v0.10.0）
+          rm -f "$RUNNER_TEMP/release.jks" out/unsigned.apk out/aligned.apk out/sdi-editor.apk.idsig
+          "$tools/apksigner" verify --print-certs out/sdi-editor.apk
+          ls -l out
+
+      # シミュレーター向けは .app の zip、実機向けは ad-hoc 署名の .ipa（入れる人が無料の Apple ID で署名し直す。参照元と同じ）
+      - name: "4. アプリを .app に組む（iOS：シミュレーター・実機）"
+        id: app
+        if: matrix.platform == 'ios'
+        working-directory: mobile
+        run: |
+          set -eu
+          mkdir -p out
+          for t in $TARGETS; do
+            echo "::group::$t"
+            find target -name '*.app' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+            dx build --platform ios --target "$t" --release --no-default-features --features mobile
+            app=$(find target -name '*.app' -type d -prune | head -1)
+            test -n "$app" || { echo "$t の .app が見つからない"; exit 1; }
+            mkdir -p "out/ios/$t"
+            ditto "$app" "out/ios/$t/sdieditor.app"
+            exe="out/ios/$t/sdieditor.app/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "out/ios/$t/sdieditor.app/Info.plist")"
+            file "$exe"
+            # **「このアプリで開く」の書類の種類が入っていること**（mobile/Dioxus.toml の [ios.raw] が使われたか）
+            plist="out/ios/$t/sdieditor.app/Info.plist"
+            /usr/libexec/PlistBuddy -c 'Print :LSSupportsOpeningDocumentsInPlace' "$plist"
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleDocumentTypes:0:LSItemContentTypes' "$plist"
+            echo "::endgroup::"
+          done
+          ditto -c -k --keepParent out/ios/aarch64-apple-ios-sim/sdieditor.app out/sdi-editor-ios-simulator.zip
+          rm -rf out/ipa && mkdir -p out/ipa/Payload
+          ditto out/ios/aarch64-apple-ios/sdieditor.app out/ipa/Payload/sdieditor.app
+          app=out/ipa/Payload/sdieditor.app
+          # ad-hoc 署名（署名の欄が無いと、署名し直す道具が置き換える相手が無い。参照元で踏んだ）。中から先に付ける
+          find "$app" -depth \( -name '*.dylib' -o -name '*.framework' -o -name '*.appex' \) -print0 |
+            while IFS= read -r -d '' part; do
+              codesign --force --sign - --timestamp=none "$part"
+            done
+          codesign --force --sign - --timestamp=none "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          (cd out/ipa && ditto -c -k --sequesterRsrc --keepParent Payload ../sdi-editor-ios-device-unsigned.ipa)
+          rm -rf out/ios out/ipa
+          ls -l out
+
+      - uses: actions/upload-artifact@v7
+        if: steps.apk.outcome == 'success' || steps.app.outcome == 'success'
+        with:
+          name: sdi-editor-${{ matrix.platform }}
+          path: mobile/out/
+
+      - name: 要約
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.platform }}"
+            echo "|段|結果|"
+            echo "|---|---|"
+            echo "|1. 土台を組む|${{ steps.core.outcome }}|"
+            echo "|2. 種類別のロジックを組む|${{ steps.kinds.outcome }}|"
+            echo "|3. dx を入れる|${{ steps.dx.outcome }}|"
+            echo "|4. APK・.app を組む|${{ steps.apk.outcome }}${{ steps.app.outcome }}|"
+            echo "|5. APK に署名する|${{ steps.sign.outcome }}|"
+          } >> "$GITHUB_STEP_SUMMARY"
