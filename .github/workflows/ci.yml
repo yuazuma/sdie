@@ -60,7 +60,28 @@ jobs:
       matrix:
         os: ${{ fromJSON((inputs.target == 'pc' || inputs.target == 'all') && '["windows-latest", "macos-latest", "ubuntu-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
+    # 止まったままにしない（2026-11-12：鍵が合わず、Windows の取り出しが 24 分止まった）
+    timeout-minutes: 90
     steps:
+      # 取り出す鍵の指紋だけを出す（鍵そのものは出さない）。非公開リポジトリの Deploy keys の指紋と比べて、Secrets に置いた
+      # 鍵が合っているかを見る（2026-11-12：Permission denied (publickey) で取り出せなかった）
+      - name: ソースを取り出す鍵を確かめる（指紋）
+        shell: bash
+        env:
+          SOURCE_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: |
+          key="$RUNNER_TEMP/source-key"
+          printf '%s\n' "$SOURCE_KEY" > "$key"
+          chmod 600 "$key"
+          if grep -q $'\r' "$key"; then echo "鍵に CR（Windows の改行）が入っている"; fi
+          if ssh-keygen -y -f "$key" > "$key.pub" 2> /dev/null; then
+            ssh-keygen -lf "$key.pub"
+          else
+            echo "::error::Secrets の SOURCE_DEPLOY_KEY を鍵として読めない（形が壊れている・合言葉付き）"
+            rm -f "$key" "$key.pub"; exit 1
+          fi
+          rm -f "$key" "$key.pub"
+
       # ソースは非公開リポジトリから取り出す（公開リポジトリにソースを置かない。2026-11-12。読み取りだけの deploy key）
       - uses: actions/checkout@v7
         with:
@@ -198,6 +219,25 @@ jobs:
         # bash と書くと pipefail が付く（`| tail` で cargo の失敗を隠さない）
         shell: bash
     steps:
+      # 取り出す鍵の指紋だけを出す（鍵そのものは出さない）。非公開リポジトリの Deploy keys の指紋と比べて、Secrets に置いた
+      # 鍵が合っているかを見る（2026-11-12：Permission denied (publickey) で取り出せなかった）
+      - name: ソースを取り出す鍵を確かめる（指紋）
+        shell: bash
+        env:
+          SOURCE_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: |
+          key="$RUNNER_TEMP/source-key"
+          printf '%s\n' "$SOURCE_KEY" > "$key"
+          chmod 600 "$key"
+          if grep -q $'\r' "$key"; then echo "鍵に CR（Windows の改行）が入っている"; fi
+          if ssh-keygen -y -f "$key" > "$key.pub" 2> /dev/null; then
+            ssh-keygen -lf "$key.pub"
+          else
+            echo "::error::Secrets の SOURCE_DEPLOY_KEY を鍵として読めない（形が壊れている・合言葉付き）"
+            rm -f "$key" "$key.pub"; exit 1
+          fi
+          rm -f "$key" "$key.pub"
+
       # ソースは非公開リポジトリから取り出す（公開リポジトリにソースを置かない。2026-11-12。読み取りだけの deploy key）
       - uses: actions/checkout@v7
         with:
