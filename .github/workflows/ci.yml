@@ -24,9 +24,9 @@ on:
         type: string
         required: true
       target:
-        description: "動かすもの（linux：PC の Linux、pc：PC の 3 OS、mobile：Android・iOS、all：PC の 3 OS とモバイル）"
+        description: "動かすもの（linux：PC の Linux、pc：PC の 3 OS、mobile：Android・iOS、android・ios：モバイルの片方だけ、all：PC の 3 OS とモバイル）"
         type: choice
-        options: [linux, pc, mobile, all]
+        options: [linux, pc, mobile, android, ios, all]
         default: linux
   # release.yml から呼ぶ（モバイルの APK・.ipa を配布物に入れる。v0.10.0）。引数は手で動かすときと同じ
   workflow_call:
@@ -54,7 +54,7 @@ jobs:
     # 名前に matrix の式を書くと、飛ばしたとき式のまま出る（「PC（${{ matrix.os }}）」と見えた）。式を書かなければ、
     # 動いたときは GitHub が OS を後ろに足す（PC (windows-latest)）
     name: PC
-    if: inputs.target != 'mobile'
+    if: inputs.target != 'mobile' && inputs.target != 'android' && inputs.target != 'ios'
     strategy:
       fail-fast: false
       matrix:
@@ -219,7 +219,7 @@ jobs:
   mobile:
     # 名前は式を書かない（PC と同じ理由）。matrix は platform だけにして、動いたときの名前を「モバイル (android)」にする
     name: モバイル
-    if: inputs.target == 'mobile' || inputs.target == 'all'
+    if: inputs.target == 'mobile' || inputs.target == 'android' || inputs.target == 'ios' || inputs.target == 'all'
     runs-on: ${{ matrix.platform == 'ios' && 'macos-latest' || 'ubuntu-latest' }}
     timeout-minutes: 150
     env:
@@ -232,7 +232,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [android, ios]
+        # android・ios を指したときは片方だけ（2026-11-13。iOS は macOS のランナーで枠を 10 倍使う）
+        platform: ${{ fromJSON((inputs.target == 'android' && '["android"]') || (inputs.target == 'ios' && '["ios"]') || '["android", "ios"]') }}
     defaults:
       run:
         # bash と書くと pipefail が付く（`| tail` で cargo の失敗を隠さない）
