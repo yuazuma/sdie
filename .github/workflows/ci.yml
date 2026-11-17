@@ -24,9 +24,9 @@ on:
         type: string
         required: true
       target:
-        description: "動かすもの（linux：PC の Linux、pc：PC の 3 OS、mobile：Android・iOS、android・ios：モバイルの片方だけ、all：PC の 3 OS とモバイル）"
+        description: "動かすもの（linux：PC の Linux、pc：PC の 3 OS、mobile：Android・iOS、android・ios：モバイルの片方だけ、all：PC の 3 OS とモバイル、perf：速さとメモリの計測だけ）"
         type: choice
-        options: [linux, pc, mobile, android, ios, all]
+        options: [linux, pc, mobile, android, ios, all, perf]
         default: linux
   # release.yml から呼ぶ（モバイルの APK・.ipa を配布物に入れる。v0.10.0）。引数は手で動かすときと同じ
   workflow_call:
@@ -54,7 +54,7 @@ jobs:
     # 名前に matrix の式を書くと、飛ばしたとき式のまま出る（「PC（${{ matrix.os }}）」と見えた）。式を書かなければ、
     # 動いたときは GitHub が OS を後ろに足す（PC (windows-latest)）
     name: PC
-    if: inputs.target != 'mobile' && inputs.target != 'android' && inputs.target != 'ios'
+    if: inputs.target != 'mobile' && inputs.target != 'android' && inputs.target != 'ios' && inputs.target != 'perf'
     strategy:
       fail-fast: false
       matrix:
@@ -200,6 +200,99 @@ jobs:
           name: sdi-editor-${{ runner.os }}
           path: out/
           if-no-files-found: error
+  # 速さとメモリの計測（2026-11-17。記録 129）。**手で target=perf を指したときだけ**動く。Linux の 1 台で、
+  # 土台（sdi-core）と殻（sdi-shell）の計測用の試験（tests/perf.rs。ふだんは動かさない）をリリースの組み方で動かし、
+  # 結果の表を要約（Summary）に載せる。ランナーは共有の機械なので、時間は目安（同じ実行の中の比で見る）
+  perf:
+    name: 計測
+    if: inputs.target == 'perf'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        # bash と書くと pipefail が付く（`| tee` で cargo の失敗を隠さない）
+        shell: bash
+    steps:
+      # 取り出す鍵の指紋だけを出す（鍵そのものは出さない）。非公開リポジトリの Deploy keys の指紋と比べて、Secrets に置いた
+      # 鍵が合っているかを見る（2026-11-12：Permission denied (publickey) で取り出せなかった）
+      - name: ソースを取り出す鍵を確かめる（指紋）
+        shell: bash
+        env:
+          SOURCE_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: |
+          key="$RUNNER_TEMP/source-key"
+          printf '%s\n' "$SOURCE_KEY" > "$key"
+          chmod 600 "$key"
+          if grep -q $'\r' "$key"; then echo "鍵に CR（Windows の改行）が入っている"; fi
+          if ssh-keygen -y -f "$key" > "$key.pub" 2> /dev/null; then
+            ssh-keygen -lf "$key.pub"
+          else
+            echo "::error::Secrets の SOURCE_DEPLOY_KEY を鍵として読めない（形が壊れている・合言葉付き）"
+            rm -f "$key" "$key.pub"; exit 1
+          fi
+          rm -f "$key" "$key.pub"
+
+      # ソースは非公開リポジトリから取り出す（公開リポジトリにソースを置かない。2026-11-12。読み取りだけの deploy key）
+      - uses: actions/checkout@v7
+        with:
+          repository: yuazuma/claudecode-rust-sdi-editor
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Rust ツールチェーンを用意する
+        # 版数は rust-toolchain.toml に従う
+        run: rustup show
+
+      - name: Linux のビルド依存を入れる
+        # iced（wgpu / winit）が X11 と Wayland のヘッダを要求する（参照元と同じ）。
+        # xvfb と libxkbcommon-x11-0 は単体の起動確認で窓を出すため
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxkbcommon-dev pkg-config xvfb libxkbcommon-x11-0
+
+      # 同梱字体はリポジトリに無い（ADR-0008。参照元と同じ）。版を固定してあるので鍵は取得スクリプト
+      - name: 同梱字体のキャッシュ
+        id: fonts
+        uses: actions/cache@v6
+        with:
+          path: assets/fonts
+          key: fonts-${{ hashFiles('tools/fetch-fonts.py') }}
+
+      - name: 同梱字体を取得する
+        if: steps.fonts.outputs.cache-hit != 'true'
+        run: python tools/fetch-fonts.py
+
+      - name: 同梱字体を確かめる
+        run: python tools/fetch-fonts.py --check
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 計測（土台：開く・検索・編集）
+        run: cargo test --release -p sdi-core --test perf -- --ignored --nocapture --test-threads=1 | tee perf-core.txt
+
+      - name: 計測（殻：描く用意・長い行・折り返し）
+        run: cargo test --release -p sdi-shell --test perf -- --ignored --nocapture --test-threads=1 | tee perf-shell.txt
+
+      - name: 要約
+        if: always()
+        run: |
+          {
+            echo "## 速さとメモリの計測（${{ inputs.ref }}）"
+            echo
+            echo "時間は 1 回の経過時間。山は作業中にいちばん多く確保していた量、残りは作業の後も持っている量（作業の前からの増え）"
+            # 表と見出しの行だけを載せる（cargo の出力は載せない）
+            for file in perf-core.txt perf-shell.txt; do
+              [ -f "$file" ] && grep -E '^(\||### |$)' "$file" || echo "（$file が無い）"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: perf
+          path: perf-*.txt
+          if-no-files-found: warn
 
   # ---- モバイル（もとは mobile.yml）----
   # 出典: claudecode-tauri-markdown-viewer migration-v2/.github/workflows/ci.yml の mobile ジョブと
