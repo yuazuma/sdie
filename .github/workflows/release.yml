@@ -33,7 +33,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  BINS: -p textedit -p jsonedit -p yamledit -p csvedit -p xmledit -p hexedit -p mdedit
+  # sdiconsole：Windows の端末用の入口（<種類>.com に写す。ほかの OS では配らない。記録 144）
+  BINS: -p textedit -p jsonedit -p yamledit -p csvedit -p xmledit -p hexedit -p mdedit -p sdiconsole
   NAMES: textedit jsonedit yamledit csvedit xmledit hexedit mdedit
 
 jobs:
