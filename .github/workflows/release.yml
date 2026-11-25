@@ -96,6 +96,13 @@ jobs:
       - name: 同梱字体を取得する
         run: python tools/fetch-fonts.py
 
+      # 依存の著作権表示の一覧（About に埋める。リポジトリに置かない。無ければ空の一覧で組める。記録 144）
+      - name: 依存の著作権表示の一覧を作る
+        shell: bash
+        run: |
+          cargo fetch
+          python tools/build-licenses.py
+
       - name: macOS の起動用を型検査する
         # Finder から開いたファイルを受け取る小さなアプリ。**Swift は macOS でしか試せない**ので、ここで書き損じを拾う
         if: runner.os == 'macOS'
