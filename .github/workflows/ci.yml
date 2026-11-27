@@ -368,6 +368,21 @@ jobs:
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
           persist-credentials: false
 
+      # モバイルのアプリにも PlemolJP Regular を入れる（2026-11-27。記録 153。PC と同じ取り方）
+      - name: 同梱字体のキャッシュ
+        id: fonts
+        uses: actions/cache@v6
+        with:
+          path: assets/fonts
+          key: fonts-${{ hashFiles('tools/fetch-fonts.py') }}
+
+      - name: 同梱字体を取得する
+        if: steps.fonts.outputs.cache-hit != 'true'
+        run: python tools/fetch-fonts.py
+
+      - name: 同梱字体を確かめる
+        run: python tools/fetch-fonts.py --check
+
       - name: Rust と対象を入れる
         run: |
           rustup show
