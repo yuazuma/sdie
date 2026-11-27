@@ -175,6 +175,8 @@ jobs:
       # 7 本の画面を明るい・暗いの配色で写して成果物に残す（ADR-0024。手元に無い OS の見た目を確かめる）。落ちても先へ進む
       - name: 画面を写す
         continue-on-error: true
+        # 止まってもジョブ全体の時間切れにしない（2026-11-27。Windows で写す途中から返らず、90 分で落ちた。記録 152）
+        timeout-minutes: 10
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then
