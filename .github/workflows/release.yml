@@ -351,6 +351,13 @@ jobs:
             echo "- Android：1 つのアプリに全種類（\`sdi-editor-${version}-android.apk\`。arm64-v8a・x86_64）"
             echo "- iOS：\`sdi-editor-${version}-ios-unsigned.ipa\` は ad-hoc 署名だけ。入れる人が無料の Apple ID で署名し直して入れる（Sideloadly・AltStore など）。\`-ios-simulator.zip\` はシミュレーター向け"
             echo "- 照合値：\`SHA256SUMS.txt\`"
+            echo
+            # 署名していないので、OS ごとの警告の外し方を書く（参照元 基本 §27.4。基本設計書 §13.5 A15）
+            echo "PC の実行ファイルには署名していません。初めて起こすときに OS が止めたら、次のように外してください。"
+            echo
+            echo "- Windows：SmartScreen の「Windows によって PC が保護されました」で「詳細情報」→「実行」"
+            echo "- macOS：\`xattr -dr com.apple.quarantine /Applications/<名前>.app\`（または Finder で右クリック →「開く」）"
+            echo "- Linux：落とした実行ファイル・AppImage に \`chmod +x <ファイル>\`"
           } > notes.md
           # 版の印は公開リポジトリのこのワークフローのコミットに打つ（ソースの入ったコミットではない）。取り出したのは
           # 非公開リポジトリなので、置き場は -R で指す
