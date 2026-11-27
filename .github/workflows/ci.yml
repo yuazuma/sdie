@@ -436,6 +436,12 @@ jobs:
 
       # **トークンを渡し、向け先を決め、ほかの取得先へ逃げない**（参照元で踏んだ：トークンが無いと GitHub の API が 403 を返し、
       # binstall が別の取得先から x86_64 の macOS 版を拾い、Apple Silicon のランナーで起動できずに落ちた）
+      # 依存の著作権表示の一覧（About に埋める。リポジトリに置かない。無ければ空の一覧で組める。記録 153）
+      - name: モバイルの依存の著作権表示の一覧を作る
+        run: |
+          (cd mobile && cargo fetch)
+          python tools/build-licenses.py --mobile
+
       - name: "3. Dioxus の CLI を入れる"
         id: dx
         env:
